@@ -1,0 +1,228 @@
+import jax
+import jax.numpy as jnp
+from jax import random, jit
+from jax.nn import one_hot
+
+import flax.linen as nn
+import optax
+
+import numpy as np
+import matplotlib.pyplot as plt
+from sklearn.metrics import confusion_matrix
+from torch.utils import data
+import torchvision as tv
+import itertools
+from functools import partial
+from tqdm import trange
+
+key = random.PRNGKey(42)
+
+classes = ('plane','car','bird','cat','deer','dog','frog','horse','ship','truck')
+num_classes = 10
+
+def plot_confusion_matrix(cm, classes, normalize=False, title='Confusion matrix', cmap=plt.cm.Blues):
+    if normalize:
+        cm = cm.astype('float') / cm.sum(axis=1)[:, np.newaxis]
+    plt.imshow(cm, interpolation='nearest', cmap=cmap)
+    plt.title(title)
+    plt.colorbar()
+    tick_marks = np.arange(len(classes))
+    plt.xticks(tick_marks, classes, rotation=45)
+    plt.yticks(tick_marks, classes)
+    fmt = '.2f' if normalize else 'd'
+    thresh = cm.max() / 2.
+    for i, j in itertools.product(range(cm.shape[0]), range(cm.shape[1])):
+        plt.text(j, i, format(cm[i, j], fmt),
+                 horizontalalignment="center",
+                 color="white" if cm[i, j] > thresh else "black")
+    plt.ylabel('True label')
+    plt.xlabel('Predicted label')
+    plt.tight_layout()
+
+train = tv.datasets.CIFAR10('./', download=True, train=True)
+train_images = train.data.astype(np.float32) / 255.0
+train_labels = np.array(train.targets)
+
+test = tv.datasets.CIFAR10('./', download=True, train=False)
+test_images = test.data.astype(np.float32) / 255.0
+test_labels = np.array(test.targets)
+
+train_labels_onehot = one_hot(jnp.array(train_labels), num_classes)
+test_labels_onehot  = one_hot(jnp.array(test_labels), num_classes)
+
+class DataGenerator(data.Dataset):
+    def __init__(self, images, labels_onehot, batch_size=128, rng_key=random.PRNGKey(1234)):
+        self.images = images
+        self.labels = labels_onehot
+        self.N = labels_onehot.shape[0]
+        self.batch_size = batch_size
+        self.key = rng_key
+
+    def __getitem__(self, index):
+        self.key, subkey = random.split(self.key)
+        idx = random.choice(subkey, self.N, (self.batch_size,), replace=False)
+        idx = np.array(idx)
+        batch_imgs = jnp.array(self.images[idx, ...])
+        batch_lbls = self.labels[idx, ...]
+        return batch_imgs, batch_lbls
+
+kernel_init = nn.initializers.xavier_uniform()
+
+class FFN(nn.Module):
+    hidden_dim: int
+    output_dim: int
+    @nn.compact
+    def __call__(self, x):
+        x = nn.Dense(self.hidden_dim, kernel_init=kernel_init)(x)
+        x = nn.gelu(x)
+        x = nn.Dense(self.output_dim, kernel_init=kernel_init)(x)
+        return x
+
+class SelfAttention(nn.Module):
+    num_heads: int
+    hidden_dim: int
+    @nn.compact
+    def __call__(self, x):
+        B, N, _ = x.shape
+        head_dim = self.hidden_dim // self.num_heads
+        qkv = nn.Dense(3 * self.hidden_dim, kernel_init=kernel_init, use_bias=False)(x)
+        q, k, v = jnp.split(qkv, 3, axis=-1)
+        q = q.reshape(B, N, self.num_heads, head_dim).transpose(0,2,1,3)
+        k = k.reshape(B, N, self.num_heads, head_dim).transpose(0,2,1,3)
+        v = v.reshape(B, N, self.num_heads, head_dim).transpose(0,2,1,3)
+        scale = 1.0 / jnp.sqrt(head_dim)
+        attn_logits = scale * jnp.matmul(q, k.transpose(0,1,3,2))
+        attn = nn.softmax(attn_logits, axis=-1)
+        out = jnp.matmul(attn, v)
+        out = out.transpose(0,2,1,3).reshape(B, N, self.hidden_dim)
+        out = nn.Dense(self.hidden_dim, kernel_init=kernel_init)(out)
+        return out
+
+class EncoderBlock(nn.Module):
+    num_heads: int
+    hidden_dim: int
+    mlp_dim: int
+    @nn.compact
+    def __call__(self, x):
+        y = nn.LayerNorm()(x)
+        y = SelfAttention(self.num_heads, self.hidden_dim)(y)
+        x = x + y
+        y = nn.LayerNorm()(x)
+        y = FFN(self.mlp_dim, self.hidden_dim)(y)
+        x = x + y
+        return x
+
+class VisionTransformer(nn.Module):
+    num_classes: int = 10
+    patch_size: int = 4
+    num_heads: int = 4
+    hidden_dim: int = 256
+    mlp_ratio: int = 2
+    num_layers: int = 6
+    @nn.compact
+    def __call__(self, x):
+        B = x.shape[0]
+        x = nn.Conv(features=self.hidden_dim,
+                    kernel_size=(self.patch_size,self.patch_size),
+                    strides=(self.patch_size,self.patch_size),
+                    padding="VALID",
+                    kernel_init=kernel_init)(x)
+        x = x.reshape(B, -1, self.hidden_dim)
+        num_patches = x.shape[1]
+        seq_len = num_patches + 1
+        cls_token = self.param("cls_token", nn.initializers.zeros, (1,1,self.hidden_dim))
+        cls_tokens = jnp.tile(cls_token, (B,1,1))
+        x = jnp.concatenate([cls_tokens, x], axis=1)
+        pos_emb = self.param("pos_embedding",
+                             nn.initializers.normal(stddev=0.02),
+                             (1,seq_len,self.hidden_dim))
+        x = x + pos_emb
+        mlp_dim = self.mlp_ratio * self.hidden_dim
+        for _ in range(self.num_layers):
+            x = EncoderBlock(self.num_heads, self.hidden_dim, mlp_dim)(x)
+        x = nn.LayerNorm()(x)
+        cls_out = x[:,0,:]
+        logits = nn.Dense(self.num_classes, kernel_init=kernel_init)(cls_out)
+        return logits
+
+class ViTClassifier:
+    def __init__(self, arch, batch, rng_key=random.PRNGKey(0)):
+        images, _ = batch
+        self.model = arch
+        self.params = self.model.init(rng_key, images)
+        print(self.model.tabulate(rng_key, images))
+        self.apply = self.model.apply
+        schedule_fn = optax.warmup_exponential_decay_schedule(
+            init_value=1e-7,
+            peak_value=1e-3,
+            warmup_steps=500,
+            transition_steps=500,
+            decay_rate=0.9,
+        )
+        self.optimizer = optax.adamw(learning_rate=schedule_fn, weight_decay=1e-2)
+        self.opt_state = self.optimizer.init(self.params)
+        self.loss_log = []
+
+    def loss(self, params, batch):
+        images, labels = batch
+        logits = self.apply(params, images)
+        loss = optax.softmax_cross_entropy(logits=logits, labels=labels)
+        return jnp.mean(loss)
+
+    @partial(jit, static_argnums=(0,))
+    def step(self, params, opt_state, batch):
+        loss, grads = jax.value_and_grad(self.loss)(params, batch)
+        updates, opt_state = self.optimizer.update(grads, opt_state, params)
+        params = optax.apply_updates(params, updates)
+        return params, opt_state, loss
+
+    def train(self, dataset, nIter=20000):
+        data_iter = iter(dataset)
+        pbar = trange(nIter)
+        for it in pbar:
+            batch = next(data_iter)
+            self.params, self.opt_state, loss = self.step(self.params, self.opt_state, batch)
+            if it % 100 == 0:
+                self.loss_log.append(float(loss))
+                pbar.set_postfix({'loss': float(loss)})
+
+BATCH_SIZE_VIT = 128
+N_STEPS_VIT = 20000
+
+key, vit_key, vit_loader_key = random.split(key, 3)
+
+train_dataset_vit = DataGenerator(train_images, train_labels_onehot, batch_size=BATCH_SIZE_VIT, rng_key=vit_loader_key)
+dummy_batch_vit = next(iter(train_dataset_vit))
+
+vit_arch = VisionTransformer(
+    num_classes=10,
+    patch_size=4,
+    num_heads=4,
+    hidden_dim=256,
+    mlp_ratio=2,
+    num_layers=6
+)
+
+vit_model = ViTClassifier(vit_arch, dummy_batch_vit, rng_key=vit_key)
+vit_model.train(train_dataset_vit, nIter=N_STEPS_VIT)
+
+plt.figure()
+plt.plot(vit_model.loss_log, lw=2)
+plt.yscale('log')
+plt.xlabel('Step (x100)')
+plt.ylabel('Loss')
+plt.title('ViT Loss')
+plt.show()
+
+test_images_jax = jnp.array(test_images)
+logits_test_vit = vit_model.apply(vit_model.params, test_images_jax)
+pred_class_vit = jnp.argmax(logits_test_vit, axis=1)
+
+acc = jnp.mean(pred_class_vit == jnp.array(test_labels))
+print(float(acc)*100)
+
+M_vit = confusion_matrix(test_labels, np.array(pred_class_vit))
+
+plt.figure(figsize=(10,10))
+plot_confusion_matrix(M_vit, classes=classes, normalize=True, title='ViT – Normalized Confusion Matrix')
+plt.show()
